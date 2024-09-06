@@ -215,6 +215,7 @@ void IngestItem::ActivePhase::_do_publish()
   msg.request_guid = _request_guid;
   msg.target_guid = _target;
   msg.transporter_type = _transporter_type;
+  msg.transporter_id = _context->name();
   msg.items = _items;
   _context->node()->ingestor_request()->publish(msg);
 }

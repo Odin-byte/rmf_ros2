@@ -271,7 +271,7 @@ public:
     {
       RCLCPP_WARN(
         _node->get_logger(),
-        "Cannot ask slotcar [%s] to stop because we have never received a "
+        "Cannot ask robot [%s] to stop because we have never received a "
         "state from it.",
         _travel_info.robot_name.c_str());
       return;
@@ -312,9 +312,9 @@ public:
     void execute(const LiftDoorOpen&) final {}
     void execute(const LiftSessionEnd&) final {}
 
-  private:
-    const std::string& _dock_name;
-  };
+    private:
+      const std::string& _dock_name;
+    };
 
   void dock(
     const std::string& dock_name,

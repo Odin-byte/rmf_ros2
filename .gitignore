@@ -4,4 +4,5 @@ tags
 *.swp
 *.swo
 *.vscode
+.vscode
 compile_commands.json
