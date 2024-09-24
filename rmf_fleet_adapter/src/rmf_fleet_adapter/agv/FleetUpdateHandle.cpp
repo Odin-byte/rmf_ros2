@@ -49,6 +49,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <stdexcept>
+#include <regex>
 
 #include <rmf_fleet_adapter/schemas/place.hpp>
 #include <rmf_fleet_adapter/schemas/priority_description__binary.hpp>
@@ -1119,6 +1120,36 @@ get_nearest_charger(
   return nearest_charger;
 }
 
+std::optional<std::size_t> FleetUpdateHandle::Implementation::
+get_charger_by_name(
+  const std::string robot_name)
+{
+  if (charging_waypoints.empty())
+    return std::nullopt;
+  // Extract the number from the robot name using regex
+  const auto& robot_number = std::stoi(std::regex_replace(robot_name, std::regex("[^0-9]"), ""));
+  std::optional<std::size_t> charger_by_name = std::nullopt;
+  for (const auto& wp : charging_waypoints)
+  {
+    // Get the name of the charger
+    const std::string* charger_name_ptr = (*planner)->get_configuration().graph().get_waypoint(wp).name();
+    if (!charger_name_ptr)
+      continue;
+
+    std::string charger_name = *charger_name_ptr;
+    // Extract the number from the charger name using regex
+    const auto& charger_number = std::stoi(std::regex_replace(charger_name, std::regex("[^0-9]"), ""));
+    // If the charger number matches the robot number, return the charger index
+    if (charger_number == robot_number)
+    {
+      charger_by_name = wp;
+      break;
+    }
+  }
+
+  return charger_by_name;
+}
+
 namespace {
 //==============================================================================
 std::optional<rmf_fleet_msgs::msg::Location> convert_location(
@@ -1905,6 +1936,229 @@ void FleetUpdateHandle::add_robot(
 
           mgr->set_idle_task(fleet->_pimpl->idle_task);
           mgr->configure_retreat_to_charger(fleet->retreat_to_charger_interval());
+
+          // -- Calling the handle_cb should always happen last --
+          if (handle_cb)
+          {
+            handle_cb(RobotUpdateHandle::Implementation::make(std::move(context)));
+          }
+          else
+          {
+            RCLCPP_WARN(
+              node->get_logger(),
+              "FleetUpdateHandle::add_robot(~) was not provided a callback to "
+              "receive the RobotUpdateHandle of the new robot. This means you will "
+              "not be able to update the state of the new robot. This is likely to "
+              "be a fleet adapter development error.");
+          }
+        });
+    });
+}
+
+void FleetUpdateHandle::add_robot_with_charger_by_name(
+  std::shared_ptr<RobotCommandHandle> command,
+  const std::string& name,
+  bool reassign_charger_by_name,
+  const rmf_traffic::Profile& profile,
+  rmf_traffic::agv::Plan::StartSet start,
+  std::function<void(std::shared_ptr<RobotUpdateHandle>)> handle_cb)
+{
+  if (start.empty())
+  {
+    // *INDENT-OFF*
+    throw std::runtime_error(
+      "[FleetUpdateHandle::add_robot] StartSet is empty. Adding a robot to a "
+      "fleet requires at least one rmf_traffic::agv::Plan::Start to be "
+      "specified.");
+    // *INDENT-ON*
+  }
+
+  rmf_traffic::schedule::ParticipantDescription description(
+    name,
+    _pimpl->name,
+    rmf_traffic::schedule::ParticipantDescription::Rx::Responsive,
+    profile);
+
+  _pimpl->writer->async_make_participant(
+    std::move(description),
+    [worker = _pimpl->worker,
+    command = std::move(command),
+    start = std::move(start),
+    reassign_charger_by_name = reassign_charger_by_name,
+    handle_cb = std::move(handle_cb),
+    fleet_wptr = weak_from_this()](
+      rmf_traffic::schedule::Participant participant)
+    {
+      auto fleet = fleet_wptr.lock();
+      if (!fleet)
+        return;
+
+      const auto charger_wp = fleet->_pimpl->get_nearest_charger(start[0]);
+
+      if (!charger_wp.has_value())
+      {
+        // *INDENT-OFF*
+        throw std::runtime_error(
+          "[FleetUpdateHandle::add_robot] Unable to find nearest charging "
+          "waypoint. Adding a robot to a fleet requires at least one charging"
+          "waypoint to be present in its navigation graph.");
+        // *INDENT-ON*
+      }
+
+      rmf_task::State state;
+      state.load_basic(start[0], charger_wp.value(), 1.0);
+
+      auto context = RobotContext::make(
+        std::move(command),
+        std::move(start),
+        std::move(participant),
+        fleet->_pimpl->mirror,
+        fleet->_pimpl->planner,
+        fleet->_pimpl->emergency_planner,
+        fleet->_pimpl->activation.task,
+        fleet->_pimpl->task_parameters,
+        fleet->_pimpl->node,
+        fleet->_pimpl->worker,
+        fleet->_pimpl->default_maximum_delay,
+        state,
+        fleet->_pimpl->task_planner);
+
+      // We schedule the following operations on the worker to make sure we do not
+      // have a multiple read/write race condition on the FleetUpdateHandle.
+      worker.schedule(
+        [fleet_wptr = std::weak_ptr<FleetUpdateHandle>(fleet),
+        node_wptr = std::weak_ptr<Node>(fleet->_pimpl->node),
+        context = std::move(context),
+        reassign_charger_by_name = reassign_charger_by_name,
+        handle_cb = std::move(handle_cb)](const auto&)
+        {
+          auto fleet = fleet_wptr.lock();
+          if (!fleet)
+            return;
+
+          auto node = node_wptr.lock();
+          if (!node)
+            return;
+
+          if (fleet->_pimpl->emergency_active)
+          {
+            context->_set_emergency(true);
+          }
+
+          // TODO(MXG): We need to perform this test because we do not currently
+          // support the distributed negotiation in unit test environments. We
+          // should create an abstract NegotiationRoom interface in rmf_traffic and
+          // use that instead.
+          if (fleet->_pimpl->negotiation)
+          {
+            using namespace std::chrono_literals;
+            auto last_interrupt_time =
+            std::make_shared<std::optional<rmf_traffic::Time>>(std::nullopt);
+            auto negotiation_license =
+            fleet->_pimpl->negotiation
+            ->register_negotiator(
+              context->itinerary().id(),
+              std::make_unique<LiaisonNegotiator>(context),
+              [w = std::weak_ptr<RobotContext>(context), last_interrupt_time]()
+              {
+                if (const auto c = w.lock())
+                {
+                  const auto& graph = c->navigation_graph();
+                  std::stringstream ss;
+                  ss << "Failed negotiation for [" << c->requester_id()
+                     << "] with these starts:"
+                     << print_starts(c->location(), graph);
+                  std::cout << ss.str() << std::endl;
+
+                  auto& last_time = *last_interrupt_time;
+                  const auto now = std::chrono::steady_clock::now();
+                  if (last_time.has_value())
+                  {
+                    if (now < *last_time + 10s)
+                      return;
+                  }
+
+                  last_time = now;
+                  if (!c->is_stubborn())
+                  {
+                    RCLCPP_INFO(
+                      c->node()->get_logger(),
+                      "Requesting replan for [%s] because it failed to negotiate",
+                      c->requester_id().c_str());
+                    c->request_replan();
+                  }
+                }
+              });
+            context->_set_negotiation_license(std::move(negotiation_license));
+          }
+
+          RCLCPP_INFO(
+            node->get_logger(),
+            "Added a robot named [%s] with participant ID [%ld]",
+            context->name().c_str(),
+            context->itinerary().id());
+
+          std::optional<std::weak_ptr<rmf_websocket::BroadcastClient>>
+          broadcast_client = std::nullopt;
+
+          if (fleet->_pimpl->broadcast_client)
+            broadcast_client = fleet->_pimpl->broadcast_client;
+
+          const auto mgr = TaskManager::make(
+            context,
+            broadcast_client,
+            std::weak_ptr<FleetUpdateHandle>(fleet));
+
+          fleet->_pimpl->task_managers.insert({context, mgr});
+
+          const auto c_it = fleet->_pimpl
+          ->unregistered_charging_assignments.find(context->name());
+          if (c_it != fleet->_pimpl->unregistered_charging_assignments.end())
+          {
+            const auto& charging = c_it->second;
+            const auto& graph = context->navigation_graph();
+            const auto* wp = graph.find_waypoint(charging.waypoint_name);
+            if (!wp)
+            {
+              RCLCPP_ERROR(
+                fleet->_pimpl->node->get_logger(),
+                "Cannot find a waypoing named [%s] for robot [%s], which was "
+                "requested as its charging point",
+                charging.waypoint_name.c_str(),
+                context->requester_id().c_str());
+            }
+            else
+            {
+              context->_set_charging(
+                wp->index(),
+                charging.mode == charging.MODE_WAIT);
+            }
+            fleet->_pimpl->unregistered_charging_assignments.erase(c_it);
+          }
+
+          mgr->set_idle_task(fleet->_pimpl->idle_task);
+          mgr->configure_retreat_to_charger(fleet->retreat_to_charger_interval());
+
+          if (reassign_charger_by_name)
+          {
+            RCLCPP_INFO(
+              node->get_logger(),
+              "Reassigning charger by name for robot [%s]",
+              context->requester_id().c_str());
+            const auto& charger_wp = fleet->_pimpl->get_charger_by_name(context->requester_id().c_str());
+            if (charger_wp.has_value())
+            {
+              context->_set_charging(charger_wp.value(), false);
+            }
+            // Check if charger_wp is a std::nullopt
+            else
+            {
+              RCLCPP_ERROR(
+                node->get_logger(),
+                "Failed to reassign charger by name for robot [%s]",
+                context->requester_id().c_str());
+            }
+          }
 
           // -- Calling the handle_cb should always happen last --
           if (handle_cb)

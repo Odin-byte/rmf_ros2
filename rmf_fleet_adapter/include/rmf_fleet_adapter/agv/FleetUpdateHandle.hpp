@@ -79,6 +79,14 @@ public:
     rmf_traffic::agv::Plan::StartSet start,
     std::function<void(std::shared_ptr<RobotUpdateHandle> handle)> handle_cb);
 
+  void add_robot_with_charger_by_name(
+    std::shared_ptr<RobotCommandHandle> command,
+    const std::string& name,
+    bool find_charger_by_name,
+    const rmf_traffic::Profile& profile,
+    rmf_traffic::agv::Plan::StartSet start,
+    std::function<void(std::shared_ptr<RobotUpdateHandle> handle)> handle_cb);
+
   /// Confirmation is a class used by the task acceptance callbacks to decide if
   /// a task description should be accepted.
   class Confirmation

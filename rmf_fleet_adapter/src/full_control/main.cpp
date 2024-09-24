@@ -790,6 +790,9 @@ struct Connections : public std::enable_shared_from_this<Connections>
   /// The container for robot update handles
   std::unordered_map<std::string, FleetDriverRobotCommandHandlePtr> robots;
 
+  /// Boolean to determine if the reassign_charger_by_name parameter is set
+  bool reassign_charger_by_name;
+
   void add_robot(
     const std::string& fleet_name,
     const rmf_fleet_msgs::msg::RobotState& state)
@@ -861,8 +864,8 @@ struct Connections : public std::enable_shared_from_this<Connections>
       return;
     }
 
-    fleet->add_robot(
-      command, robot_name, traits->profile(),
+    fleet->add_robot_with_charger_by_name(
+      command, robot_name, reassign_charger_by_name, traits->profile(),
       starts,
       [c = weak_from_this(), command, robot_name = std::move(robot_name)](
         const rmf_fleet_adapter::agv::RobotUpdateHandlePtr& updater)
@@ -933,8 +936,16 @@ std::shared_ptr<Connections> make_fleet(
   const auto& node = adapter->node();
   node->declare_parameter("enable_responsive_wait", true);
 
+  node->declare_parameter("reassign_charger_by_name", true);
+  bool reassign_charger_by_name = node->get_parameter("reassign_charger_by_name").as_bool();
+  RCLCPP_INFO(
+    node->get_logger(),
+    "Parameter: [reassign_charger_by_name] set to: %s",
+    reassign_charger_by_name ? "true" : "false");
+
   std::shared_ptr<Connections> connections = std::make_shared<Connections>();
   connections->adapter = adapter;
+  connections->reassign_charger_by_name = reassign_charger_by_name;
   connections->on_set_param =
     node->get_node_parameters_interface()->add_on_set_parameters_callback(
     [w = connections->weak_from_this()](

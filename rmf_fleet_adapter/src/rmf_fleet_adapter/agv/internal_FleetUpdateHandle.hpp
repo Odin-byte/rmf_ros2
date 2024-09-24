@@ -647,6 +647,9 @@ public:
   std::optional<std::size_t> get_nearest_charger(
     const rmf_traffic::agv::Planner::Start& start);
 
+  std::optional<std::size_t> get_charger_by_name(
+    const std::string robot_name);
+
   Expectations aggregate_expectations() const;
 
   /// Helper function to check if assignments are valid. An assignment set is
