@@ -212,7 +212,33 @@ public:
   Implementation(std::shared_ptr<rclcpp::Node> node_)
   : node{std::move(node_)}
   {
-    // ros2 param
+    // ros2 params
+    // Declare the parameter for evaluator type
+    std::string evaluator_type = node->declare_parameter<std::string>("evaluator_type", "quickest_finish");
+
+    // Instantiate the appropriate evaluator based on the parameter value
+    std::shared_ptr<bidding::Auctioneer::Evaluator> evaluator;
+    if (evaluator_type == "quickest_finish")
+    {
+      evaluator = std::make_shared<bidding::QuickestFinishEvaluator>();
+      RCLCPP_INFO(node->get_logger(), "Dispatcher evaluator set to QuickestFinishEvaluator");
+    }
+    else if (evaluator_type == "least_fleet_cost")
+    {
+      evaluator = std::make_shared<bidding::LeastFleetCostEvaluator>();
+      RCLCPP_INFO(node->get_logger(), "Dispatcher evaluator set to LeastFleetCostEvaluator");
+    }
+    else if (evaluator_type == "least_fleet_diff_cost")
+    {
+      evaluator = std::make_shared<bidding::LeastFleetDiffCostEvaluator>();
+      RCLCPP_INFO(node->get_logger(), "Dispatcher evaluator set to LeastFleetDiffCostEvaluator");
+    }
+    else
+    {
+      RCLCPP_WARN(node->get_logger(), "Unknown evaluator type [%s], defaulting to QuickestFinishEvaluator", evaluator_type.c_str());
+      evaluator = std::make_shared<bidding::QuickestFinishEvaluator>();
+    }
+
     double bidding_time_window_param =
       node->declare_parameter<double>("bidding_time_window", 2.0);
     RCLCPP_INFO(node->get_logger(),
@@ -307,7 +333,7 @@ public:
       {
         this->conclude_bid(task_id, std::move(winner), errors);
       },
-      std::make_shared<bidding::QuickestFinishEvaluator>());
+      evaluator);
 
     // Setup up stream srv interfaces
     submit_task_srv = node->create_service<SubmitTaskSrv>(
